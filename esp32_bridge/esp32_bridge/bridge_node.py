@@ -3,7 +3,7 @@
 """
 esp_bridge.py  •  LiDAR (+ yaw / mirror / static TF)  •  /cmd_vel → ESP  •  /odom  (ROS 2 Jazzy)
 
-* WebSocket-скан от ESP32  →  /scan   (sensor_msgs/LaserScan)
+* WebSocket-скан от ESP32  →  /lidar_scan   (sensor_msgs/LaserScan)
 * REST-команда /setSpeed   ← /cmd_vel (geometry_msgs/Twist)
 * HTTP /state → /odom + TF (nav_msgs/Odometry + динамический odom→base_link)
 
@@ -87,18 +87,26 @@ class ESPBridge(Node):
         self.declare_parameter("ws_port", 80)
         self.declare_parameter("ws_path", "/ws")
 
-        # ── имена фреймов и диапазон LiDAR-a ───────────────────────
+        # ── имена фреймов и диапазон LIDAR-a ───────────────────────
         self.declare_parameter("frame_id", "laser")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
-        self.declare_parameter("range_min", 0.05)
-        self.declare_parameter("range_max", 16.0)
+        self.declare_parameter("lidar_range_min", 0.05)
+        self.declare_parameter("lidar_range_max", 2.0)
+
+        # ── дальномер ───────────────────────
+        self.declare_parameter("rangefinder_range_min", 0.05)
+        self.declare_parameter("rangefinder_range_max", 1.2)
+        self.declare_parameter("rangefinder_id", "range")
+        self.declare_parameter("rangefinder_xyz", [0.04, 0.0, 0.02])
+        self.declare_parameter("rangefinder_rpy_deg", [0.0, 0.0, 0.0])
 
         # ── настройка ориентации LiDAR-а ───────────────────────────
         self.declare_parameter("lidar_yaw_deg", 180.0)        # сдвиг облака CW
         self.declare_parameter("lidar_mirror", True)          # зеркально (True/False)
         self.declare_parameter("lidar_xyz", [0.0, 0.0, 0.10]) # положение на раме
         self.declare_parameter("lidar_rpy_deg", [0.0, 0.0, 0.0])  # ориентация
+        
 
         # ── формируем URL WebSocket ――
         host = self.get_parameter("host").value
@@ -107,13 +115,15 @@ class ESPBridge(Node):
         self.ws_url = f"ws://{host}:{port}{path}"
 
         # ── ROS паблишеры/сабскрайберы ────────────────────────────
-        self.scan_pub = self.create_publisher(LaserScan, "/scan", 10)
+        self.scan_pub = self.create_publisher(LaserScan, "/lidar_scan", 10)
         self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
+        self.range_pub = self.create_publisher(LaserScan, "/range", 10)
         self.create_subscription(Twist, "/cmd_vel", self.cmd_cb, 10)
 
         # динамический TF (odom→base_link) + статический (base_link→laser)
         self.tf_br = TransformBroadcaster(self)
         self.static_br = StaticTransformBroadcaster(self)
+        self.static_br2 = StaticTransformBroadcaster(self)
         self._publish_static_tf()
 
         # ― запускаем отдельный event-loop для WebSocket (лидар) ―
@@ -145,11 +155,26 @@ class ESPBridge(Node):
         tf.transform.translation.y = float(xyz[1])
         tf.transform.translation.z = float(xyz[2])
         tf.transform.rotation = q
-
         # latched – публикуем один раз
         self.static_br.sendTransform(tf)
         self.get_logger().info("Published static TF base_link → laser")
-        
+
+        xyz = self.get_parameter("rangefinder_xyz").value
+        rpy_deg = self.get_parameter("rangefinder_rpy_deg").value
+        roll, pitch, yaw = [math.radians(a) for a in rpy_deg]
+        q = rpy_to_quat(roll, pitch, yaw)
+        tf = TransformStamped()
+        tf.header.stamp = self.get_clock().now().to_msg()
+        tf.header.frame_id = self.get_parameter("base_frame").value
+        tf.child_frame_id = self.get_parameter("rangefinder_id").value
+        tf.transform.translation.x = float(xyz[0])
+        tf.transform.translation.y = float(xyz[1])
+        tf.transform.translation.z = float(xyz[2])
+        tf.transform.rotation = q
+        # latched – публикуем один раз
+        self.static_br2.sendTransform(tf)
+        self.get_logger().info("Published static TF base_link → range")
+
         tf = TransformStamped()
         tf.header.stamp = self.get_clock().now().to_msg()
         tf.header.frame_id = "map"
@@ -254,7 +279,7 @@ class ESPBridge(Node):
         if yaw_deg:
             ang = [a + yaw_deg for a in ang]
 
-        # нормализуем, чтобы начало ≈ −π
+        # нормализуем, чтобы начало ≈ −π //
         if ang[0] > 180.0:
             ang = [a - 360.0 for a in ang]
 
@@ -266,8 +291,8 @@ class ESPBridge(Node):
         scan.angle_min = rad[0]
         scan.angle_max = rad[-1]
         scan.angle_increment = (rad[-1] - rad[0]) / (len(rad) - 1)
-        scan.range_min = self.get_parameter("range_min").value
-        scan.range_max = self.get_parameter("range_max").value
+        scan.range_min = self.get_parameter("lidar_range_min").value
+        scan.range_max = self.get_parameter("lidar_range_max").value
         scan.ranges = rng
         scan.intensities = inten
         self.scan_pub.publish(scan)
@@ -283,6 +308,7 @@ class ESPBridge(Node):
             return
 
         x, y, th = js["odom"]["x"], js["odom"]["y"], js["odom"]["th"]
+        rng = js["rangefinder"]["value"]/1000
 
         od = Odometry()
         od.header.stamp = self.get_clock().now().to_msg()
@@ -305,6 +331,18 @@ class ESPBridge(Node):
         tf.transform.translation.y = y
         tf.transform.rotation = od.pose.pose.orientation
         self.tf_br.sendTransform(tf)
+
+        scan = LaserScan()
+        scan.header.stamp = self.get_clock().now().to_msg()
+        scan.header.frame_id = self.get_parameter("rangefinder_id").value
+        scan.angle_min = 0.0
+        scan.angle_max = 0.001
+        scan.angle_increment = 0.001
+        scan.range_min = self.get_parameter("rangefinder_range_min").value
+        scan.range_max = self.get_parameter("rangefinder_range_max").value
+        scan.ranges = [rng] * 2
+        scan.intensities = [1.0 if rng<1.1 else 0.0] * 2
+        self.range_pub.publish(scan)
 
 
 # ――― точка входа ――――――――――――――――――――――――――――――――――――――――――――――――――
