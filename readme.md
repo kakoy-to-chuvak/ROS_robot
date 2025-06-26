@@ -40,7 +40,7 @@
 * | 6 | Понижающий DC-DC                  | https://aliexpress.ru/item/32896699470.html
 * | 7 | Переключатель питания             | https://aliexpress.ru/item/4000973563250.html
 * | 8 | Type-C зарядка  2S 1A             | https://aliexpress.ru/item/1005006628986640.html
-* | 9 | Лазерный дальномер CJVL53L0XV2    | 
+* | 9 | Лазерный дальномер CJVL53L0XV2    | https://aliexpress.ru/item/1005004482337637.html
 
 
 ---
@@ -128,7 +128,7 @@ source install/setup.bash
 | --- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
 | 1   | `ros2 run esp32_bridge esp32_bridge --ros-args -p host:=<IP_ESP32> `                                                        | WebSocket-мост                        |
 | 2   | `rviz2`  → `File → Open Config` → `config/rviz/rosik.rviz`                                                                  | Визуализация данных                   |
-| 3   | `ros2 launch ros2_laser_scan_merger merge_2_scan.launch.py`                                                                 | Объединение точек лидара и дальномера |
+| 3   | `ros2 launch ros2_laser_scan_merger merge_2_scan.launch.py --params-file <FILE_PATH>/scan_merger.yaml`                                                                 | Объединение точек лидара и дальномера |
 | 4   | `ros2 launch slam_toolbox online_sync_launch.py slam_params_file:=~/ros2_ws/src/esp32_bridge/config/slam_param.yaml`        | Онлайн SLAM                           |
 | 5   | `ros2 run teleop_twist_keyboard teleop_twist_keyboard`                                                                      | Телеуправление                        |
 | 6   | `ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '~/ros2_ws/maps/my_map'}"`   | Сохранить карту                       |
