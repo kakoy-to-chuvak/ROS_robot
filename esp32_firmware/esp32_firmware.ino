@@ -1,40 +1,55 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
+  uint8_t temprature_sens_read();
+#ifdef __cplusplus
+}
+#endif
+
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <driver/uart.h>
 #include "esp_task_wdt.h"
 #include "driver/pcnt.h"
 #include <math.h>
+#include <Adafruit_VL53L0X.h>
+#include <Adafruit_NeoPixel.h>  // Библиотека для работы с адресной светодиодной лентой
 
 /* ---------- Wi-Fi ---------- */
-constexpr char WIFI_SSID[] = "net";
-constexpr char WIFI_PASS[] = "password";
+#define WIFI_SSID "robotx"
+#define WIFI_PASS "78914040"
 
 /* ---------- Пины и параметры робота ---------- */
 // Двигатели (H-мосты)
-#define L_A 33
-#define L_B 32
-#define R_A 27
-#define R_B 26
+#define MOTOR_LA 33
+#define MOTOR_LB 32
+#define MOTOR_RA 27
+#define MOTOR_RB 26
+
 // Энкодеры (PCNT)
-#define ENC_R_A 18
-#define ENC_R_B 19
-#define ENC_L_A 34
-#define ENC_L_B 35
+#define ENCODER_RA 18
+#define ENCODER_RB 19
+#define ENCODER_LA 34
+#define ENCODER_LB 35
+
 // Описание механики
-constexpr float WHEEL_D = 0.044f;                                    // диаметр колеса, м
-constexpr float BASE_L = 0.100f;                                     // база (расстояние между колёсами), м
-constexpr int TICKS_REV = 2930;                                      // количество тиков энкодера на оборот колеса
+#define WHEEL_D 0.044f  // диаметр колеса, м
+#define BASE_L 0.1f     // база (расстояние между колёсами), м
+#define TICKS_REV 2930  // количество тиков энкодера на оборот колеса
+#define BATTERY_COEF 0.0025074626865672f
 constexpr float MM_PER_TICK = WHEEL_D * M_PI * 1000.0f / TICKS_REV;  // мм за один тик
 
 /* ---------- Глобальные переменные состояния ---------- */
 volatile uint8_t dutyLA = 0, dutyLB = 0, dutyRA = 0, dutyRB = 0;  // текущие ШИМ для H-мостов
 volatile int32_t encTotL = 0, encTotR = 0;                        // накопленные тики энкодера
 volatile int32_t prevEncL = 0, prevEncR = 0;
-volatile float speedL = 0.0f, speedR = 0.0f;                   // измеренные скорости, мм/с
-volatile float tgtL = 0.0f, tgtR = 0.0f;                       // целевые скорости, мм/с
-volatile float odomX = 0.0f, odomY = 0.0f, odomTh = 0.0f;      // одометрия: положение робота (м, м, рад)
-volatile float kp = 1.0f, ki = 0.8f, kd = 0.02f, kff = 0.25f;  // PID коэффициенты
+volatile float speedL = 0.0f, speedR = 0.0f;               // измеренные скорости, мм/с
+volatile float tgtL = 0.0f, tgtR = 0.0f;                   // целевые скорости, мм/с
+volatile float odomX = 0.0f, odomY = 0.0f, odomTh = 0.0f;  // одометрия: положение робота (м, м, рад)
+volatile float kp = 0.f, ki = 0.f, kd = 0.f, kff = 1.f;    // PID коэффициенты
 
 volatile uint32_t lastCmdMs = 0;
 
@@ -42,7 +57,7 @@ volatile uint32_t lastCmdMs = 0;
 bool alignMode = false;
 float alignSign = 1.0f;
 int32_t alignRefL = 0, alignRefR = 0;
-constexpr float kAlign = 1.0f;  // коэффициент P-контроллера выравнивания (мм -> мм/с)
+#define kAlign 1.0f  // коэффициент P-контроллера выравнивания (мм -> мм/с)
 
 /* ---------- Настройки лидара ---------- */
 #define LIDAR_RX_PIN 17  // lidar TX -> ESP RX
@@ -50,9 +65,9 @@ constexpr float kAlign = 1.0f;  // коэффициент P-контроллер
 #define LIDAR_BAUD 115200
 
 static const uint8_t HDR[4] = { 0x55, 0xAA, 0x03, 0x08 };
-static const uint8_t BODY_LEN = 32;      // байт в теле пакета лидара (8 точек по 4 байта)
-static const uint8_t INTENSITY_MIN = 2;  // минимальное значение интенсивности для учёта точки
-static const float MAX_SPREAD_DEG = 20.0;
+#define BODY_LEN 32      // байт в теле пакета лидара (8 точек по 4 байта)
+#define INTENSITY_MIN 2  // минимальное значение интенсивности для учёта точки
+#define MAX_SPREAD_DEG 20.0
 #define FRAME_LEN 20   // длина упакованных данных на каждую порцию (2 байта нач.угол, 2 байта кон.угол, 8*2 байта дистанции)
 #define MAX_FRAMES 64  // макс. количество порций на один полный оборот (64*20 ≈ 1280 байт)
 static uint8_t scanBuf[MAX_FRAMES * FRAME_LEN];
@@ -60,9 +75,33 @@ static uint8_t *wr = scanBuf;
 static uint8_t frameCount = 0;
 static float prevStartAngle = -1;
 
+/* ---------- Дальномер ---------- */
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+bool is_ranging = 1;
+unsigned int measured_distance = 0;
+
+/* ---------- Светодиодная лента ----------*/
+#define LED1_PIN 14  // Пин, к которому подключена лента
+#define LED1_COUNT 8
+#define LED2_PIN 25  // Пин, к которому подключена лента
+#define LED2_COUNT 10
+#define LED_TYPE (NEO_GRB + NEO_KHZ800)                       // Тип светодиодов (формат данных и частота)
+Adafruit_NeoPixel strip_up(LED1_COUNT, LED1_PIN, LED_TYPE);   // Создаём объект для управления лентой
+Adafruit_NeoPixel strip_hor(LED2_COUNT, LED2_PIN, LED_TYPE);  // Создаём объект для управления лентой
+byte show1 = 0;
+byte show2 = 1;
+
+
 /* ---------- Статистика ---------- */
 volatile uint32_t stat_rx = 0;  // принятых 20-байтных пакетов от LDS
 volatile uint32_t stat_tx = 0;  // переданных полных сканов по WS
+float battery_charge = 0;
+float cpu_temp = 0;  // Конвертация в °C
+float cpu_load = 0;  // Конвертация в °C
+uint32_t total_ram = 0;
+uint32_t free_ram = 0;
+uint32_t used_ram = 0;
+
 
 /* ---------- Вспомогательные функции ---------- */
 inline float decodeAngle(uint16_t raw) {
@@ -107,10 +146,40 @@ inline uint16_t crc16(uint16_t crc, uint8_t v) {
   return crc;
 }
 
+
+
+/* ---------- Настройка дальномера ---------- */
+bool setupRangefinder(Adafruit_VL53L0X *_rangefinder, uint32_t _timing_budget) {
+  Serial.println("Starting ranging.....");
+  if (_rangefinder->begin()) {
+    _rangefinder->configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_DEFAULT);
+    _rangefinder->setMeasurementTimingBudgetMicroSeconds(_timing_budget);
+    _rangefinder->startRangeContinuous();
+    Serial.println("Ranging started successfully!");
+    return 1;
+  } else {
+    Serial.println("Ranging not started");
+    return 0;
+  }
+}
+
+
+/* ---------- Настройка ленты ---------- */
+void statOnStrip(Adafruit_NeoPixel *_strip, float stat, uint8_t ledcount, byte minGcolor, byte maxGcolor) {
+  int reqLeds = ceil(ledcount * stat);
+  short colorG = minGcolor + ceil((maxGcolor - minGcolor) * stat);
+  uint32_t color = _strip->Color(255 - colorG, colorG, 0);
+  _strip->show();
+  for (int i = 0; i < reqLeds; i++) {
+    _strip->setPixelColor(i, color);
+  }
+}
+
 /* ---------- Настройка WebSocket и HTTP ---------- */
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 AsyncWebSocketClient *wsClient = nullptr;
+
 
 // Обработчик событий WebSocket
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
@@ -157,21 +226,28 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
   }
 }
 
+
+
 // Настройка HTTP-роутов
 void setupRoutes() {
   server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
     // Формируем JSON с текущим состоянием робота
     char json[512];
     snprintf(json, sizeof(json),
-             "{\"duty\":{\"L_A\":%u,\"L_B\":%u,\"R_A\":%u,\"R_B\":%u},"
+             "{\"duty\":{\"MOTOR_LA\":%u,\"MOTOR_LB\":%u,\"MOTOR_RA\":%u,\"(MOTOR_RB\":%u},"
              "\"enc\":{\"left\":%ld,\"right\":%ld},"
              "\"speed\":{\"left\":%.1f,\"right\":%.1f},"
              "\"target\":{\"left\":%.1f,\"right\":%.1f},"
-             "\"odom\":{\"x\":%.3f,\"y\":%.3f,\"th\":%.3f}}",
+             "\"odom\":{\"x\":%.3f,\"y\":%.3f,\"th\":%.3f},"
+             "\"rangefinder\":{\"value\":%lu},"
+             "\"robot\":{\"battery_charge\":%.2f,\"cpu_load\":%.2f,\"used_ram\":%llu,\"cpu_temp\":%.2f}}",
              dutyLA, dutyLB, dutyRA, dutyRB,
              encTotL, encTotR,
-             speedL, speedR, tgtL, tgtR,
-             odomX, odomY, odomTh);
+             speedL, speedR,
+             tgtL, tgtR,
+             odomX, odomY, odomTh,
+             measured_distance,
+             battery_charge, cpu_load, used_ram, cpu_temp);
     request->send(200, "application/json", json);
   });
   server.on("/setSpeed", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -216,27 +292,27 @@ void setupRoutes() {
   });
 }
 
+
+
 /* ---------- Управление моторами (PWM) ---------- */
 inline void setPWM(uint8_t pin, uint8_t value) {
   analogWrite(pin, value);
   // Обновляем глобальные duty-переменные для мониторинга
   switch (pin) {
-    case L_A: dutyLA = value; break;
-    case L_B: dutyLB = value; break;
-    case R_A: dutyRA = value; break;
-    case R_B: dutyRB = value; break;
+    case MOTOR_LA: dutyLA = value; break;
+    case MOTOR_LB: dutyLB = value; break;
+    case MOTOR_RA: dutyRA = value; break;
+    case MOTOR_RB: dutyRB = value; break;
   }
 }
 inline void stopMotors() {
-  setPWM(L_A, 0);
-  setPWM(L_B, 0);
-  setPWM(R_A, 0);
-  setPWM(R_B, 0);
-  iTermR = 0;
-  prevErrorR = 0;
-  iTermL = 0;
-  prevErrorL = 0;
+  setPWM(MOTOR_LA, 0);
+  setPWM(MOTOR_LB, 0);
+  setPWM(MOTOR_RA, 0);
+  setPWM(MOTOR_RB, 0);
 }
+
+
 
 /* ---------- Инициализация счетчиков PCNT ---------- */
 void pcntInit(pcnt_unit_t unit, gpio_num_t pulse_pin, gpio_num_t ctrl_pin) {
@@ -264,6 +340,8 @@ inline int16_t readEncoder(pcnt_unit_t unit) {
   return count;
 }
 
+
+
 /* ---------- PID-регулятор скорости ---------- */
 void updatePID() {
   static uint32_t prevMillis = millis();
@@ -277,11 +355,11 @@ void updatePID() {
   prevMillis = now;
 
   // Сброс интегральной части при изменении целевой скорости или переходе через 0
-  if (fabs(tgtL) < 1.0f) {
+  if (tgtL != lastTgtL || fabs(tgtL) < 1.0f) {
     iTermL = 0;
     prevErrorL = 0;
   }
-  if (fabs(tgtR) < 1.0f) {
+  if (tgtR != lastTgtR || fabs(tgtR) < 1.0f) {
     iTermR = 0;
     prevErrorR = 0;
   }
@@ -338,11 +416,13 @@ void updatePID() {
     pwmRA = 0;
     pwmRB = (uint8_t)(-outputR);
   }
-  setPWM(L_A, pwmLA);
-  setPWM(L_B, pwmLB);
-  setPWM(R_A, pwmRA);
-  setPWM(R_B, pwmRB);
+  setPWM(MOTOR_LA, pwmLA);
+  setPWM(MOTOR_LB, pwmLB);
+  setPWM(MOTOR_RA, pwmRA);
+  setPWM(MOTOR_RB, pwmRB);
 }
+
+
 
 /* ---------- Задача чтения Лидара (поток на Core 1) ---------- */
 void lidarTask(void *param) {
@@ -417,28 +497,47 @@ void lidarTask(void *param) {
   }
 }
 
+
+
+/* ---------- Обработчик команд ---------- */
+void commandHandler() {
+  String command = Serial.readString();
+  command.trim();
+  if (command.indexOf("getIp") == 0) {
+    Serial.println(WiFi.localIP());
+  } else if (command.indexOf("getBatt") == 0) {
+    Serial.println(battery_charge);
+  }
+}
+
+
+
 /* ---------- SETUP ---------- */
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== ESP32 Lidar+Motor Bridge ===");
+  Serial.println("\n\n=== ESP32 Lidar+Motor Bridge ===");
   // Wi-Fi подключение
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.println("Connecting WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
     Serial.print('.');
   }
   Serial.printf("\nWiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  // Запуск дальномера
+  if (is_ranging) is_ranging = setupRangefinder(&lox, 100000);
+  if (!is_ranging) measured_distance = -1;
   // Настройка GPIO
-  pinMode(L_A, OUTPUT);
-  pinMode(L_B, OUTPUT);
-  pinMode(R_A, OUTPUT);
-  pinMode(R_B, OUTPUT);
+  pinMode(MOTOR_LA, OUTPUT);
+  pinMode(MOTOR_LB, OUTPUT);
+  pinMode(MOTOR_RA, OUTPUT);
+  pinMode(MOTOR_RB, OUTPUT);
   stopMotors();
   // PCNT для энкодеров
-  pcntInit(PCNT_UNIT_0, (gpio_num_t)ENC_R_A, (gpio_num_t)ENC_R_B);
-  pcntInit(PCNT_UNIT_1, (gpio_num_t)ENC_L_A, (gpio_num_t)ENC_L_B);
+  pcntInit(PCNT_UNIT_0, (gpio_num_t)ENCODER_RA, (gpio_num_t)ENCODER_RB);
+  pcntInit(PCNT_UNIT_1, (gpio_num_t)ENCODER_LA, (gpio_num_t)ENCODER_LB);
   // Запуск веб-сервера и WebSocket
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
@@ -446,12 +545,23 @@ void setup() {
   server.begin();
   // Запуск задачи лидара на ядре 0
   xTaskCreatePinnedToCore(lidarTask, "LidarTask", 4096, nullptr, 2, nullptr, 0);
+
+  strip_hor.begin();
+  strip_up.begin();
+  strip_hor.show();
+  strip_up.show();
+
+  battery_charge = analogRead(39) * BATTERY_COEF;
+  total_ram = ESP.getHeapSize();
 }
+
+
 
 /* ---------- LOOP ---------- */
 void loop() {
   static uint32_t t10 = 0, t20 = 0, t2000 = 0;
   uint32_t now = millis();
+
   // Каждые 10 мс: считываем энкодеры, обновляем одометрию
   if (now - t10 >= 10) {
     t10 = now;
@@ -473,6 +583,12 @@ void loop() {
     if (odomTh > M_PI) odomTh -= 2 * M_PI;
     if (odomTh < -M_PI) odomTh += 2 * M_PI;
   }
+
+  //получение значения дальномера
+  if (is_ranging && lox.isRangeComplete()) {
+    measured_distance = lox.readRange();
+  }
+
   // Каждые 20 мс: вычисляем текущие скорости колес (мм/с)
   if (now - t20 >= 20) {
     float dt = (now - t20) * 0.001f;
@@ -482,17 +598,46 @@ void loop() {
     prevEncL = encTotL;
     prevEncR = encTotR;
   }
+
   // Каждые 20 мс: обновляем PID-регулятор и ШИМ моторов
   static uint32_t tPID = 0;
   if (now - tPID >= 20) {
     tPID = now;
     updatePID();
   }
+
+  static uint32_t tStat = 0;
+  static uint16_t idleCounter = 0;
+  idleCounter++;
+  if (now - tStat >= 1000) {
+    unsigned long count = idleCounter;
+    idleCounter = 0;
+    cpu_temp = (temprature_sens_read() - 32) / 1.8;  // Конвертация в °C
+
+    free_ram = ESP.getFreeHeap();
+    used_ram = total_ram - free_ram;
+
+    static unsigned long maxIdle = 0;
+    if (count > maxIdle) maxIdle = count;
+    cpu_load = 1.0 - (float)count / maxIdle;
+    battery_charge = (battery_charge * 20 + analogRead(39) * BATTERY_COEF) / 21.0;
+    switch (show1) {
+      case 0: statOnStrip(&strip_up, battery_charge / 8.4, 8, 0, 180); break;
+      case 1: statOnStrip(&strip_up, cpu_load, 8, 180, 0); break;
+      case 2: statOnStrip(&strip_up, cpu_temp / 100.0, 8, 180, 0); break;
+      case 3: statOnStrip(&strip_up, used_ram / total_ram, 8, 180, 0); break;
+    }
+
+    statOnStrip(&strip_hor, cpu_load, 10, 180, 0);
+
+    tStat = now;
+  }
+
+
   // Обслуживание клиентов WebSocket (освобождение памяти для отключившихся)
   ws.cleanupClients();
-  // Каждые 2 с: выводим IP (для мониторинга, не обязательно)
-  if (now - t2000 >= 2000) {
-    t2000 = now;
-    Serial.println(WiFi.localIP());
+
+  if (Serial.available()) {
+    commandHandler();
   }
 }
